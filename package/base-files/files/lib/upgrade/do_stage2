@@ -6,13 +6,22 @@ include /lib/upgrade
 
 v "Performing system upgrade..."
 if type 'platform_do_upgrade' >/dev/null 2>/dev/null; then
-	platform_do_upgrade "$IMAGE"
+	platform_do_upgrade "$IMAGE" || {
+		v "Upgrade failed! Stopping before config restore and reboot."
+		exit 1
+	}
 else
-	default_do_upgrade "$IMAGE"
+	default_do_upgrade "$IMAGE" || {
+		v "Upgrade failed! Stopping before config restore and reboot."
+		exit 1
+	}
 fi
 
 if [ -n "$UPGRADE_BACKUP" ] && type 'platform_copy_config' >/dev/null 2>/dev/null; then
-	platform_copy_config
+	platform_copy_config || {
+		v "Config restore failed! Stopping before reboot."
+		exit 1
+	}
 fi
 
 v "Upgrade completed"

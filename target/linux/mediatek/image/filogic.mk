@@ -3910,3 +3910,14 @@ ifneq ($(CONFIG_TARGET_ROOTFS_INITRAMFS),)
 endif
 endef
 TARGET_DEVICES += zyxel_wx5600-t0-ubootmod
+
+define Device/clx_s20p
+  DEVICE_VENDOR := CLX
+  DEVICE_MODEL := S20P
+  DEVICE_DTS := mt7986a-clx-s20p
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_PACKAGES := kmod-usb3 kmod-mt7915e kmod-mt7986-firmware mt7986-wo-firmware mkf2fs
+  IMAGES := sysupgrade.bin
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+endef
+TARGET_DEVICES += clx_s20p

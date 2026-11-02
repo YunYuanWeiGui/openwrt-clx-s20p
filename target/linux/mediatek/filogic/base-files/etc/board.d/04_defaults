@@ -5,6 +5,11 @@ board=$(board_name)
 board_config_update
 
 case $board in
+clx,s20p)
+	ucidef_set_country CN
+	ucidef_set_wireless 2g OpenWrt-2.4G none
+	ucidef_set_wireless 5g OpenWrt-5G none
+	;;
 openwrt,one)
 	ucidef_set_wireless_mac_count 2g 7
 	ucidef_set_wireless_mac_count 5g 7

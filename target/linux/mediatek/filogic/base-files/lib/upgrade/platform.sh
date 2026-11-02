@@ -106,6 +106,217 @@ xiaomi_initial_setup()
 	esac
 }
 
+clx_s20p_emmc_do_upgrade() {
+	local image="$1"
+	local tmpdir sysdev partname part_count
+	local kern_dev root_dev kern_size root_size
+	local kern_bytes root_bytes kern_blocks root_blocks
+	local kern_capacity root_capacity squashfs_words squashfs_bytes
+
+	tmpdir="$(mktemp -d)" || return 1
+
+	# Extract both image members before touching eMMC.
+	tar -xOf "$image" sysupgrade-clx_s20p/kernel > "$tmpdir/kernel" 2>/dev/null || {
+		echo "S20P: cannot extract kernel."
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	tar -xOf "$image" sysupgrade-clx_s20p/root > "$tmpdir/root" 2>/dev/null || {
+		echo "S20P: cannot extract rootfs."
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	fit_check_image "$tmpdir/kernel" || {
+		echo "S20P: invalid FIT kernel."
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	[ "$(dd if="$tmpdir/root" bs=4 count=1 2>/dev/null)" = "hsqs" ] || {
+		echo "S20P: invalid SquashFS rootfs."
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	# Locate unique kernel and rootfs partitions on mmcblk0.
+	part_count=0
+	for sysdev in /sys/class/block/mmcblk0p[0-9]*; do
+		[ -r "$sysdev/uevent" ] || continue
+		partname="$(sed -n 's/^PARTNAME=//p' "$sysdev/uevent")"
+
+		case "$partname" in
+			kernel)
+				part_count=$((part_count + 1))
+				kern_dev="/dev/$(basename "$sysdev")"
+				;;
+			rootfs)
+				part_count=$((part_count + 1))
+				root_dev="/dev/$(basename "$sysdev")"
+				;;
+		esac
+	done
+
+	[ "$part_count" -eq 2 ] &&
+	[ "$kern_dev" = "/dev/mmcblk0p4" ] &&
+	[ "$root_dev" = "/dev/mmcblk0p5" ] || {
+		echo "S20P: expected unique kernel p4 and rootfs p5 partitions."
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	[ -b "$kern_dev" ] && [ -b "$root_dev" ] || {
+		echo "S20P: eMMC partition device is missing."
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	kern_capacity="$(cat /sys/class/block/mmcblk0p4/size)" || {
+		rm -rf "$tmpdir"
+		return 1
+	}
+	root_capacity="$(cat /sys/class/block/mmcblk0p5/size)" || {
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	case "$kern_capacity:$root_capacity" in
+		*[!0-9:]*|:*|*:)
+			echo "S20P: invalid partition size."
+			rm -rf "$tmpdir"
+			return 1
+			;;
+	esac
+
+	kern_bytes="$(wc -c < "$tmpdir/kernel")"
+	root_bytes="$(wc -c < "$tmpdir/root")"
+
+	[ "$kern_bytes" -gt 0 ] &&
+	[ "$root_bytes" -gt 0 ] &&
+	[ $((root_bytes % 512)) -eq 0 ] || {
+		echo "S20P: invalid image size or unaligned rootfs."
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	kern_blocks=$(((kern_bytes + 511) / 512))
+
+	# Read SquashFS bytes_used (64-bit little-endian at offset 40).
+	squashfs_words="$(hexdump -v -s 40 -n 8 -e '1/4 "%u\n"' "$tmpdir/root")" || {
+		echo "S20P: cannot read SquashFS superblock."
+		rm -rf "$tmpdir"
+		return 1
+	}
+	set -- $squashfs_words
+	[ "$#" -eq 2 ] || {
+		echo "S20P: invalid SquashFS bytes_used field."
+		rm -rf "$tmpdir"
+		return 1
+	}
+	case "$1:$2" in
+		*[!0-9:]*|:*|*:)
+			echo "S20P: invalid SquashFS bytes_used value."
+			rm -rf "$tmpdir"
+			return 1
+			;;
+	esac
+	squashfs_bytes=$(($1 + ($2 * 4294967296)))
+	[ "$squashfs_bytes" -gt 0 ] && [ "$squashfs_bytes" -le "$root_bytes" ] || {
+		echo "S20P: invalid SquashFS filesystem size."
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	# fstools aligns the overlay start to 64 KiB (128 sectors).
+	root_blocks=$(((squashfs_bytes + 65535) / 65536 * 128))
+
+	[ "$kern_blocks" -le "$kern_capacity" ] &&
+	[ $((root_blocks + 8)) -le "$root_capacity" ] || {
+		echo "S20P: image exceeds partition capacity."
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	echo "S20P: invalidating old kernel..."
+	dd if=/dev/zero of="$kern_dev" bs=512 count=8 || {
+		echo "S20P: cannot invalidate old kernel."
+		rm -rf "$tmpdir"
+		return 1
+	}
+	sync || {
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	echo "S20P: writing rootfs..."
+	dd if="$tmpdir/root" of="$root_dev" bs=512 || {
+		echo "S20P: rootfs write failed."
+		rm -rf "$tmpdir"
+		return 1
+	}
+	sync || {
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	dd if="$root_dev" of="$tmpdir/root.readback" bs=512 count="$((root_bytes / 512))" || {
+		echo "S20P: rootfs readback failed."
+		rm -rf "$tmpdir"
+		return 1
+	}
+	cmp -s "$tmpdir/root" "$tmpdir/root.readback" || {
+		echo "S20P: rootfs verification failed."
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	# Invalidate any stale overlay filesystem at the aligned offset.
+	dd if=/dev/zero of="$root_dev" bs=512 seek="$root_blocks" count=8 || {
+		echo "S20P: cannot invalidate old overlay."
+		rm -rf "$tmpdir"
+		return 1
+	}
+	sync || {
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	echo "S20P: writing kernel..."
+	dd if="$tmpdir/kernel" of="$kern_dev" bs=512 || {
+		echo "S20P: kernel write failed."
+		rm -rf "$tmpdir"
+		return 1
+	}
+	sync || {
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	dd if="$kern_dev" of="$tmpdir/kernel.readback.raw" bs=512 count="$kern_blocks" || {
+		echo "S20P: kernel readback failed."
+		rm -rf "$tmpdir"
+		return 1
+	}
+	head -c "$kern_bytes" "$tmpdir/kernel.readback.raw" > "$tmpdir/kernel.readback" || {
+		rm -rf "$tmpdir"
+		return 1
+	}
+	cmp -s "$tmpdir/kernel" "$tmpdir/kernel.readback" || {
+		echo "S20P: kernel verification failed."
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	# Used by emmc_copy_config() to restore backup after rootfs.
+	export EMMC_ROOT_DEV="$root_dev"
+	export EMMC_ROOTFS_BLOCKS="$root_blocks"
+
+	rm -rf "$tmpdir"
+	echo "S20P: eMMC upgrade and readback verification successful."
+	return 0
+}
+
 platform_do_upgrade() {
 	local board=$(board_name)
 
@@ -168,6 +379,10 @@ platform_do_upgrade() {
 	zyxel,ex5601-t0-ubootmod|\
 	zyxel,wx5600-t0-ubootmod)
 		fit_do_upgrade "$1"
+		;;
+	clx,s20p)
+		unset CI_DATAPART EMMC_DATA_DEV
+		clx_s20p_emmc_do_upgrade "$1"
 		;;
 	acer,predator-w6|\
 	acer,predator-w6d|\
@@ -346,12 +561,67 @@ platform_do_upgrade() {
 
 PART_NAME=firmware
 
+clx_s20p_check_image() {
+	local tmpdir members expected magic
+
+	tmpdir="$(mktemp -d)" || return 74
+
+	members="$(tar -tf "$1" 2>/dev/null)" || {
+		rm -rf "$tmpdir"
+		return 74
+	}
+
+	expected="$(printf '%s\n' \
+		'sysupgrade-clx_s20p/' \
+		'sysupgrade-clx_s20p/CONTROL' \
+		'sysupgrade-clx_s20p/kernel' \
+		'sysupgrade-clx_s20p/root')"
+
+	[ "$members" = "$expected" ] || {
+		echo "Invalid S20P image members."
+		rm -rf "$tmpdir"
+		return 74
+	}
+
+	[ "$(tar -xOf "$1" sysupgrade-clx_s20p/CONTROL 2>/dev/null)" = "BOARD=clx_s20p" ] || {
+		echo "Invalid S20P image board."
+		rm -rf "$tmpdir"
+		return 74
+	}
+
+	tar -xOf "$1" sysupgrade-clx_s20p/kernel > "$tmpdir/kernel" 2>/dev/null &&
+	tar -xOf "$1" sysupgrade-clx_s20p/root > "$tmpdir/root" 2>/dev/null || {
+		echo "Cannot extract S20P image."
+		rm -rf "$tmpdir"
+		return 74
+	}
+
+	fit_check_image "$tmpdir/kernel" || {
+		rm -rf "$tmpdir"
+		return 74
+	}
+
+	magic="$(dd if="$tmpdir/root" bs=4 count=1 2>/dev/null)"
+	[ "$magic" = "hsqs" ] || {
+		echo "Invalid S20P root filesystem."
+		rm -rf "$tmpdir"
+		return 74
+	}
+
+	rm -rf "$tmpdir"
+	return 0
+}
+
 platform_check_image() {
 	local board=$(board_name)
 
 	[ "$#" -gt 1 ] && return 1
 
 	case "$board" in
+	clx,s20p)
+		clx_s20p_check_image "$1"
+		return $?
+		;;
 	abt,asr3000|\
 	acer,predator-w6x-ubootmod|\
 	asus,zenwifi-bt8-ubootmod|\
@@ -443,6 +713,7 @@ platform_copy_config() {
 			emmc_copy_config
 		fi
 		;;
+	clx,s20p|\
 	acer,predator-w6|\
 	acer,predator-w6d|\
 	acer,vero-w6m|\

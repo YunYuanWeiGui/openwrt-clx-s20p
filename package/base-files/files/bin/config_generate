@@ -187,7 +187,7 @@ generate_network() {
 				uci -q batch <<-EOF
 					delete network.${1}6
 					set network.${1}6='interface'
-					set network.${1}6.device='$device'
+					set network.${1}6.device='@${1}'
 					set network.${1}6.proto='dhcpv6'
 				EOF
 			}
